@@ -12,8 +12,7 @@ setuptools.setup(
     long_description=long_description,
     long_description_content_type="text/markdown",
     url="https://github.com/fmi-faim/faim-dl",
-    package_dir={"": "faim_dl"},
-    packages=setuptools.find_packages(where="faim_dl"),
+    packages=setuptools.find_packages(),
     python_requires=">=3.9",
     project_urls={
         "Bug Tracker": "https://github.com/fmi-faim/faim-dl/issues"
@@ -29,6 +28,9 @@ setuptools.setup(
         "wandb==0.12.11",
         "monai==0.8.1",
         "scikit-learn==1.0.2",
-        "mosaicml==0.5"
+        "mosaicml==0.5",
+        "zarr==2.11.1",
+        "ome-zarr==0.3.1",
+        "pandas==1.4.1"
     ]
 )
