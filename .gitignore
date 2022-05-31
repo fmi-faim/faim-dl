@@ -133,3 +133,6 @@ dmypy.json
 
 # wandb
 wandb/
+
+# datasets
+dataset/
