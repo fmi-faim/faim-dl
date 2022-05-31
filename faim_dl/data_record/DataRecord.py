@@ -1,5 +1,5 @@
 import json
-from os.path import join, dirname, split, exists
+from os.path import join, dirname, split, exists, basename, splitext
 
 import numpy as np
 import zarr
@@ -12,13 +12,28 @@ import sqlite3 as db
 
 from skimage.transform import rescale
 
+from faim_dl.histogram import UIntHistogram
+
 
 class DataRecord:
 
-    def __init__(self, path: str, name: str, tags: list[str], description: str, documentation: str, authors: list[dict],
+    def __init__(self, path: str, name: str, spacing: tuple[float], min_shape: tuple[int], chunks: tuple[int],
+                 tags: list[str], description: str, documentation: str, authors: list[dict],
                  cite: list[dict], license: str = "BSD-2-Clause"):
         isinstance(name, str)
         self.name = name
+
+        isinstance(spacing, tuple)
+        all(isinstance(s, float) for s in spacing)
+        self.target_spacing = spacing
+
+        isinstance(min_shape, tuple)
+        all(isinstance(s, int) for s in min_shape)
+        self.min_shape = min_shape
+
+        isinstance(chunks, tuple)
+        all(isinstance(c, int) for c in chunks)
+        self.chunks = chunks
 
         isinstance(tags, list)
         all(isinstance(t, str) for t in tags)
@@ -53,10 +68,15 @@ class DataRecord:
 
         self.source_files_db = join(self.dir, "source_files.db")
 
+        self.histograms = {}
+
     def serialize(self):
         rdf = {
             "format_version": "0.2.0",
             "name": self.name,
+            "spacing": self.target_spacing,
+            "min_shape": self.min_shape,
+            "chunks": self.chunks,
             "tags": self.tags,
             "description": self.description,
             "documentation": self.documentation,
@@ -75,9 +95,12 @@ class DataRecord:
         with open(json_name, 'r') as f:
             rdf = json.load(f)
 
-        return DefaultDataRecord(
+        datarecord = DefaultDataRecord(
             path=split(dirname(json_name))[0],
             name=rdf["name"],
+            spacing=tuple(rdf["spacing"]),
+            min_shape=tuple(rdf["min_shape"]),
+            chunks=tuple(rdf["chunks"]),
             tags=rdf["tags"],
             description=rdf["description"],
             documentation=rdf["documentation"],
@@ -85,6 +108,12 @@ class DataRecord:
             cite=rdf["cite"],
             license=rdf["license"]
         )
+        datarecord.attachments = rdf["attachments"]
+        for k in datarecord.attachments.keys():
+            datarecord.histograms[k] = UIntHistogram.load(
+                join(datarecord.dir, basename(datarecord.attachments[k]["histogram"])))
+
+        return datarecord
 
 
 class DefaultDataRecord(DataRecord):
@@ -106,18 +135,15 @@ class DefaultDataRecord(DataRecord):
                         name,
                         source_files,
                         target_files,
-                        chunks,
                         axes,
                         data_spacing,
-                        target_spacing,
-                        min_shape,
                         source_dtype,
                         target_dtype,
                         target_name='nuclei'):
         assert source_dtype in [np.uint8, np.int8, np.int16, np.int32,
-                                        np.int64, np.float64, np.float32, np.float16, np.complex64, np.complex128, bool]
+                                np.int64, np.float64, np.float32, np.float16, np.complex64, np.complex128, bool]
         assert target_dtype in [np.uint8, np.int8, np.int16, np.int32,
-                                        np.int64, np.float64, np.float32, np.float16, np.complex64, np.complex128, bool]
+                                np.int64, np.float64, np.float32, np.float16, np.complex64, np.complex128, bool]
 
         if name in list(container.group_keys()):
             root = container[name]
@@ -125,21 +151,21 @@ class DefaultDataRecord(DataRecord):
             root = container.create_group(name)
             root.attrs['name'] = name
             root.attrs['type'] = 'ome-zarr'
+            self.histograms[name] = UIntHistogram()
 
         with db.connect(self.source_files_db) as conn:
             c = conn.cursor()
             c.execute(
-                "CREATE TABLE IF NOT EXISTS {} ('source_file' text NOT NULL, 'target_file' text NOT NULL, 'index' INT NOT NULL)".format(
+                "CREATE TABLE IF NOT EXISTS {} ('source_file' text NOT NULL, 'target_file' text NOT NULL, 'record_name' text NOT NULL)".format(
                     name)
             )
 
-            index = len(root)
-            if np.all(target_spacing == data_spacing):
-                factors = np.array((1,) * len(target_spacing))
+            if np.all(self.target_spacing == data_spacing):
+                factors = np.array((1,) * len(self.target_spacing))
             else:
-                factors = np.array(target_spacing) / np.array(data_spacing)
+                factors = np.array(self.target_spacing) / np.array(data_spacing)
 
-            for i, (src_f, trg_f) in enumerate(zip(source_files, target_files)):
+            for src_f, trg_f in zip(source_files, target_files):
 
                 assert exists(src_f), "File {} could not be found.".format(src_f)
                 assert exists(trg_f), "File {} could not be found.".format(trg_f)
@@ -148,43 +174,50 @@ class DefaultDataRecord(DataRecord):
                 trg_file_exists = DefaultDataRecord.file_in_db(c, trg_f)
 
                 if not src_file_exists and not trg_file_exists:
-                    grp = root.create_group(str(index))
+                    record_name = splitext(basename(src_f))[0]
+                    grp = root.create_group(record_name)
                     labels_grp = grp.create_group('labels')
                     label_grp = labels_grp.create_group(target_name)
-                    self.add_image(axes, chunks, data_spacing, source_dtype, factors, grp, min_shape, src_f,
-                                   DefaultDataRecord.mi_ma_fun)
+                    self.add_image(axes, data_spacing, source_dtype, factors, grp, src_f,
+                                   self.histograms[name])
                     if target_dtype in [np.uint8, np.int8, np.int16, np.int32,
                                         np.int64]:
-                        self.add_label_image(axes, chunks, data_spacing, target_dtype, factors, label_grp, min_shape,
+                        self.add_label_image(axes, data_spacing, target_dtype, factors, label_grp,
                                              trg_f)
                     else:
-                        self.add_image(axes, chunks, data_spacing, target_dtype, factors, label_grp, min_shape, trg_f,
-                                       DefaultDataRecord.mi_ma_fun)
+                        self.add_image(axes, data_spacing, target_dtype, factors, label_grp, trg_f,
+                                       self.histograms[name])
 
-                    c.execute("INSERT INTO {} (source_file, target_file, [index]) VALUES ('{}', '{}', {})".format(name, src_f, trg_f, index))
-                    index += 1
+                    c.execute(
+                        "INSERT INTO {} (source_file, target_file, record_name) VALUES ('{}', '{}', '{}')".format(name,
+                                                                                                                  src_f,
+                                                                                                                  trg_f,
+                                                                                                                  record_name))
 
-            self.attachments[name] = join(".", name)
+            self.attachments[name] = {"data": join(".", name), "histogram": join(".", name + "_hist.npz")}
+            self.histograms[name].save(join(self.dir, self.attachments[name]["histogram"]))
 
-    def add_image(self, axes, chunks, data_spacing, dtype, factors, grp, min_shape, file, mi_ma_fun):
+    def add_image(self, axes, data_spacing, dtype, factors, grp, file, hist):
         img = imread(file).astype(dtype)
-
-        img = DefaultDataRecord.normalize_min_max(img, *mi_ma_fun(img))
 
         if np.any(factors != 1):
             img = rescale(img, scale=factors, mode='reflect', anti_aliasing=True, preserve_range=True,
                           order=1).astype(img.dtype)
 
-        img = self.pad(img, min_shape, mode='reflect')
+        hist.update(img)
 
+        img = self.pad(img, self.min_shape, mode='reflect')
+
+        chunks = self.chunks
         if "c" not in axes:
             img = img[np.newaxis]
-            axes = ("c", ) + axes
-            chunks = (1, ) + chunks
-            data_spacing = (1, ) + data_spacing
+            axes = ("c",) + axes
+            chunks = (1,) + chunks
+            data_spacing = (1,) + data_spacing
             factors = np.concatenate([np.array([1]), factors])
 
         write_image(image=img, group=grp, chunks=chunks, axes=axes, scaler=Scaler(downscale=1, max_layer=0))
+        # TODO: Save histogram here?
         grp.attrs['dataspecs'] = {
             "source_file": file,
             "shape": img.shape,
@@ -197,22 +230,26 @@ class DefaultDataRecord(DataRecord):
             pad_width = []
             for img_s, min_s in zip(img.shape, min_shape):
                 margin = min_s - img_s
-                pad_width.append([margin // 2, min_s - margin // 2])
-            img = np.pad(img, pad_width=pad_width, mode=mode, constant_values=constant_values)
+                pad_width.append([margin // 2, (min_s - img_s) - margin // 2])
+            if mode == 'constant':
+                img = np.pad(img, pad_width=pad_width, mode=mode, constant_values=constant_values)
+            else:
+                img = np.pad(img, pad_width=pad_width, mode=mode)
         return img
 
-    def add_label_image(self, axes, chunks, data_spacing, dtype, factors, grp, min_shape, file):
+    def add_label_image(self, axes, data_spacing, dtype, factors, grp, file):
         img = imread(file).astype(dtype)
         if np.any(factors != 1):
             img = self.rescale_labeling(img, factors=factors).astype(dtype)
 
-        img = self.pad(img, min_shape, mode='constant', constant_values=-1)
+        img = self.pad(img, self.min_shape, mode='constant', constant_values=-1)
 
+        chunks = self.chunks
         if "c" not in axes:
             img = img[np.newaxis]
-            axes = ("c", ) + axes
-            chunks = (1, ) + chunks
-            data_spacing = (1, ) + data_spacing
+            axes = ("c",) + axes
+            chunks = (1,) + chunks
+            data_spacing = (1,) + data_spacing
             factors = np.concatenate([np.array([1]), factors])
 
         write_image(image=img, group=grp, chunks=chunks, axes=axes, scaler=Scaler(downscale=1, max_layer=0))
@@ -222,15 +259,6 @@ class DefaultDataRecord(DataRecord):
             "axes": axes,
             "data_spacing": tuple(np.array(data_spacing, dtype=np.float32) * factors)
         }
-
-    @staticmethod
-    def mi_ma_fun(img):
-        mi, ma = np.quantile(img, [0.03, 0.998])
-        return mi, ma
-
-    @staticmethod
-    def normalize_min_max(data, mi, ma):
-        return (data - mi) / (ma - mi)
 
     @staticmethod
     def file_in_db(c, file):
@@ -255,7 +283,7 @@ class DefaultDataRecord(DataRecord):
             "SELECT COUNT(1) FROM '{}' WHERE target_file = '{}'".format(table, file)
         ).fetchall()[0][0])
 
-    def create_train_val_test_dataset(self, source_files, target_files, chunks, axes, data_spacing, target_spacing,
+    def create_train_val_test_dataset(self, source_files, target_files, axes, data_spacing, target_spacing,
                                       min_shape,
                                       val_fraction,
                                       test_fration,
@@ -275,72 +303,54 @@ class DefaultDataRecord(DataRecord):
 
         self.add_train_data(source_files=source_files[random_idx[:n_train_samples]],
                             target_files=target_files[random_idx[:n_train_samples]],
-                            chunks=chunks,
                             axes=axes,
                             data_spacing=data_spacing,
-                            target_spacing=target_spacing,
-                            min_shape=min_shape,
                             source_dtype=source_dtype,
                             target_dtype=target_dtype)
 
         self.add_val_data(source_files=source_files[random_idx[n_train_samples:n_train_samples + n_val_samples]],
                           target_files=target_files[random_idx[n_train_samples:n_train_samples + n_val_samples]],
-                          chunks=chunks,
                           axes=axes,
                           data_spacing=data_spacing,
-                          target_spacing=target_spacing,
-                          min_shape=min_shape,
                           source_dtype=source_dtype,
                           target_dtype=target_dtype)
 
         self.add_test_data(source_files=source_files[random_idx[-n_test_samples:]],
                            target_files=target_files[random_idx[-n_test_samples:]],
-                           chunks=chunks,
                            axes=axes,
                            data_spacing=data_spacing,
-                           target_spacing=target_spacing,
-                           min_shape=min_shape,
                            source_dtype=source_dtype,
                            target_dtype=target_dtype)
 
-    def add_train_data(self, source_files, target_files, chunks, axes, data_spacing, target_spacing, min_shape,
+    def add_train_data(self, source_files, target_files, axes, data_spacing,
                        source_dtype=np.float32, target_dtype=np.uint16):
         assert len(source_files) == len(target_files)
         self._create_dataset(self.zarr_container, name="train_data",
                              source_files=source_files,
                              target_files=target_files,
-                             chunks=chunks,
                              axes=axes,
                              data_spacing=data_spacing,
-                             target_spacing=target_spacing,
-                             min_shape=min_shape,
                              source_dtype=source_dtype,
                              target_dtype=target_dtype)
 
-    def add_val_data(self, source_files, target_files, chunks, axes, data_spacing, target_spacing, min_shape,
+    def add_val_data(self, source_files, target_files, axes, data_spacing,
                      source_dtype=np.float32, target_dtype=np.uint16):
         assert len(source_files) == len(target_files)
         self._create_dataset(self.zarr_container, name="val_data",
                              source_files=source_files,
                              target_files=target_files,
-                             chunks=chunks,
                              axes=axes,
                              data_spacing=data_spacing,
-                             target_spacing=target_spacing,
-                             min_shape=min_shape,
                              source_dtype=source_dtype,
                              target_dtype=target_dtype)
 
-    def add_test_data(self, source_files, target_files, chunks, axes, data_spacing, target_spacing, min_shape,
+    def add_test_data(self, source_files, target_files, axes, data_spacing,
                       source_dtype=np.float32, target_dtype=np.uint16):
         assert len(source_files) == len(target_files)
         self._create_dataset(self.zarr_container, name="test_data",
                              source_files=source_files,
                              target_files=target_files,
-                             chunks=chunks,
                              axes=axes,
                              data_spacing=data_spacing,
-                             target_spacing=target_spacing,
-                             min_shape=min_shape,
                              source_dtype=source_dtype,
                              target_dtype=target_dtype)
