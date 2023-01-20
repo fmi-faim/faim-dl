@@ -38,6 +38,101 @@ class UIntHistogram:
         freq = list(np.histogram(data, np.arange(offset, offset + bins))[0])
         return offset, bins, freq
 
+    def _aggregate_histograms(self, offset_data, bins, freq):
+        """
+        Integrate new frequencies into existing histogram.
+
+        :param offset_data:
+        :param bins:
+        :param freq:
+        :return:
+        """
+        lower_shift = offset_data - self.offset
+        upper_shift = self.offset + self.bins - (offset_data + bins)
+
+        if lower_shift == 0 and upper_shift == 0:
+            # Old and new frequencies cover the same range:
+            # [old frequencies]
+            # [new frequencies]
+            self.frequencies = self._add(self.frequencies, freq)
+        elif lower_shift < 0 and (offset_data + bins - 1 >= self.offset) and (
+                offset_data + bins - 1 <= self.offset + self.bins - 1):
+            # New frequencies have additional lower ones.
+            #     [old frequencies]
+            # [new frequencies]
+            self.frequencies[
+            :(offset_data + bins - self.offset - 1)] = self._add(
+                self.frequencies[:(offset_data + bins - self.offset - 1)],
+                freq[(self.offset - offset_data):])
+            self.frequencies = freq[
+                               :(self.offset - offset_data)] + self.frequencies
+            self.offset = offset_data
+            self.bins = len(self.frequencies) + 1
+        elif lower_shift < 0 and (offset_data + bins - 1 < self.offset):
+            # New frequencies only have additional lower ones.
+            #                       [old frequencies]
+            # [new frequencies]
+            self.frequencies = freq + [0, ] * (self.offset - (
+                        offset_data + bins) + 1) + self.frequencies
+            self.offset = offset_data
+            self.bins = len(self.frequencies) + 1
+        elif offset_data >= self.offset and offset_data <= (
+                self.offset + self.bins - 2) and offset_data + bins - 2 > (
+                self.offset + self.bins - 2):
+            # New frequencies have additional upper ones.
+            #     [old frequencies]
+            #            [new frequencies]
+            self.frequencies[
+            -(self.offset + self.bins - 1 - offset_data):] = self._add(
+                self.frequencies[
+                -(self.offset + self.bins - 1 - offset_data):],
+                freq[:(self.offset + self.bins - offset_data)])
+            self.frequencies = self.frequencies + freq[(
+                                                                   self.offset + self.bins - offset_data - 1):]
+            self.bins = len(self.frequencies) + 1
+        elif (offset_data) > (self.offset + self.bins - 2):
+            # New frequencies have only additional upper ones.
+            #     [old frequencies]
+            #                           [new frequencies]
+            self.frequencies = self.frequencies + [0, ] * (
+                        offset_data - (self.offset + self.bins - 1)) + freq
+            self.bins = len(self.frequencies) + 1
+        elif lower_shift >= 0 and upper_shift >= 0:
+            # New frequencies are completely covered.
+            # [          old frequencies          ]
+            #           [new frequencies]
+            if upper_shift == 0:
+                self.frequencies[lower_shift:] = self._add(
+                    self.frequencies[lower_shift:], freq)
+            else:
+                self.frequencies[lower_shift:-upper_shift] = self._add(
+                    self.frequencies[lower_shift:-upper_shift], freq)
+        else:
+            # Old frequencies are completely covered.
+            #     [old frequencies]
+            # [    new frequencies    ]
+            self.frequencies = self._add(self.frequencies,
+                                         freq[(self.offset - offset_data):(
+                                                 (offset_data + bins - 1) - (
+                                                     self.offset + bins - 1))])
+            self.frequencies = freq[:(
+                        self.offset - offset_data)] + self.frequencies + freq[(
+                                                                                          (
+                                                                                                      offset_data + bins) - (
+                                                                                                  self.offset + bins)):]
+            self.offset = offset_data
+            self.bins = len(self.frequencies) + 1
+
+    def combine(self, histogram):
+        """
+        Combine this histogram with another UIntHistogram.
+
+        :param histogram: to merge with this
+        """
+        self._aggregate_histograms(offset_data=histogram.offset,
+                                   bins=histogram.bins,
+                                   freq=histogram.freq)
+
     def update(self, data):
         """
         Update histogram by adding more data.
@@ -51,68 +146,9 @@ class UIntHistogram:
             self.offset, self.bins, self.frequencies = self._get_hist(data)
         else:
             offset_data, bins, freq = self._get_hist(data)
+            self._aggregate_histograms(offset_data=offset_data, bins=bins,
+                                       freq=freq)
 
-            lower_shift = offset_data - self.offset
-            upper_shift = self.offset + self.bins - (offset_data + bins)
-
-            if lower_shift == 0 and upper_shift == 0:
-                # Old and new frequencies cover the same range:
-                # [old frequencies]
-                # [new frequencies]
-                self.frequencies = self._add(self.frequencies, freq)
-            elif lower_shift < 0 and (offset_data + bins - 1 >= self.offset) and (
-                    offset_data + bins - 1 <= self.offset + self.bins - 1):
-                # New frequencies have additional lower ones.
-                #     [old frequencies]
-                # [new frequencies]
-                self.frequencies[:(offset_data + bins - self.offset - 1)] = self._add(
-                    self.frequencies[:(offset_data + bins - self.offset - 1)],
-                    freq[(self.offset - offset_data):])
-                self.frequencies = freq[:(self.offset - offset_data)] + self.frequencies
-                self.offset = offset_data
-                self.bins = len(self.frequencies) + 1
-            elif lower_shift < 0 and (offset_data + bins - 1 < self.offset):
-                # New frequencies only have additional lower ones.
-                #                       [old frequencies]
-                # [new frequencies]
-                self.frequencies = freq + [0, ] * (self.offset - (offset_data + bins) + 1) + self.frequencies
-                self.offset = offset_data
-                self.bins = len(self.frequencies) + 1
-            elif offset_data >= self.offset and offset_data <= (
-                    self.offset + self.bins - 2) and offset_data + bins - 2 > (self.offset + self.bins - 2):
-                # New frequencies have additional upper ones.
-                #     [old frequencies]
-                #            [new frequencies]
-                self.frequencies[-(self.offset + self.bins - 1 - offset_data):] = self._add(
-                    self.frequencies[-(self.offset + self.bins - 1 - offset_data):],
-                    freq[:(self.offset + self.bins - offset_data)])
-                self.frequencies = self.frequencies + freq[(self.offset + self.bins - offset_data - 1):]
-                self.bins = len(self.frequencies) + 1
-            elif (offset_data) > (self.offset + self.bins - 2):
-                # New frequencies have only additional upper ones.
-                #     [old frequencies]
-                #                           [new frequencies]
-                self.frequencies = self.frequencies + [0, ] * (offset_data - (self.offset + self.bins - 1)) + freq
-                self.bins = len(self.frequencies) + 1
-            elif lower_shift >= 0 and upper_shift >= 0:
-                # New frequencies are completely covered.
-                # [          old frequencies          ]
-                #           [new frequencies]
-                if upper_shift == 0:
-                    self.frequencies[lower_shift:] = self._add(self.frequencies[lower_shift:], freq)
-                else:
-                    self.frequencies[lower_shift:-upper_shift] = self._add(self.frequencies[lower_shift:-upper_shift], freq)
-            else:
-                # Old frequencies are completely covered.
-                #     [old frequencies]
-                # [    new frequencies    ]
-                self.frequencies = self._add(self.frequencies,
-                                             freq[(self.offset - offset_data):(
-                                                     (offset_data + bins - 1) - (self.offset + bins - 1))])
-                self.frequencies = freq[:(self.offset - offset_data)] + self.frequencies + freq[((offset_data + bins) - (
-                        self.offset + bins)):]
-                self.offset = offset_data
-                self.bins = len(self.frequencies) + 1
 
     def plot(self):
         """
